@@ -3,6 +3,8 @@
 #import "GPUImageContext.h"
 #import "GLProgram.h"
 #import "GPUImageFilter.h"
+#import "THImageMovie.h"
+#import "THImageMovieManager.h"
 
 NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
 (
@@ -37,6 +39,14 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
     BOOL isRecording;
 }
 
+@property(nonatomic, strong) NSArray *movies;
+@property(nonatomic, strong) AVAssetReader *assetAudioReader;
+@property(nonatomic, strong) AVAssetReaderAudioMixOutput *assetAudioReaderTrackOutput;
+
+@property(nonatomic, assign) dispatch_group_t recordingDispatchGroup;
+@property(nonatomic, assign) BOOL audioFinished, videoFinished, isFrameRecieved;
+@property(nonatomic, copy)  void (^onFramePixelBufferReceived)(CMTime, CVPixelBufferRef);
+
 // Movie recording
 - (void)initializeMovieWithOutputSettings:(NSMutableDictionary *)outputSettings;
 
@@ -68,17 +78,19 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
 #pragma mark -
 #pragma mark Initialization and teardown
 
-- (id)initWithMovieURL:(NSURL *)newMovieURL size:(CGSize)newSize;
+- (id)initWithMovieURL:(NSURL *)newMovieURL size:(CGSize)newSize movies:(NSArray *)movies;
 {
-    return [self initWithMovieURL:newMovieURL size:newSize fileType:AVFileTypeQuickTimeMovie outputSettings:nil];
+    return [self initWithMovieURL:newMovieURL size:newSize fileType:AVFileTypeQuickTimeMovie outputSettings:nil movies:movies];
 }
 
-- (id)initWithMovieURL:(NSURL *)newMovieURL size:(CGSize)newSize fileType:(NSString *)newFileType outputSettings:(NSMutableDictionary *)outputSettings;
+- (id)initWithMovieURL:(NSURL *)newMovieURL size:(CGSize)newSize fileType:(NSString *)newFileType outputSettings:(NSMutableDictionary *)outputSettings movies:(NSArray *)movies;
 {
     if (!(self = [super init]))
     {
 		return nil;
     }
+    
+    self.movies = movies;
 
     _shouldInvalidateAudioSampleWhenDone = NO;
     
@@ -160,6 +172,7 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
     }
 #endif
 }
+
 
 #pragma mark -
 #pragma mark Movie recording
@@ -267,18 +280,270 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
     }
 }
 
+#pragma mark setupAssetWriter
+- (void)setupAudioAssetReader {
+    
+    NSMutableArray *audioTracks = [NSMutableArray array];
+    
+    for(THImageMovie *movie in self.movies){
+        AVAsset *asset = movie.asset;
+        if(asset){
+            NSArray *_audioTracks = [asset tracksWithMediaType:AVMediaTypeAudio];
+            if(_audioTracks.count > 0){
+                [audioTracks addObject:_audioTracks.firstObject];
+            }
+        }
+    }
+    
+    //NSLog(@"audioTracks: %@", audioTracks);
+    
+    AVMutableComposition* mixComposition = [AVMutableComposition composition];
+    
+    for(AVAssetTrack *track in audioTracks){
+        if(![track isKindOfClass:[NSNull class]]){
+            //NSLog(@"track url: %@ duration: %.2f", track.asset, CMTimeGetSeconds(track.asset.duration));
+            AVMutableCompositionTrack *compositionCommentaryTrack = [mixComposition addMutableTrackWithMediaType:AVMediaTypeAudio
+                                                                     
+                                                                                                preferredTrackID:kCMPersistentTrackID_Invalid];
+            [compositionCommentaryTrack insertTimeRange:CMTimeRangeMake(kCMTimeZero, track.asset.duration)
+                                                ofTrack:track
+                                                 atTime:kCMTimeZero error:nil];
+        }
+    }
+    
+    self.assetAudioReader = [AVAssetReader assetReaderWithAsset:mixComposition error:nil];
+    self.assetAudioReaderTrackOutput =
+    [[AVAssetReaderAudioMixOutput alloc] initWithAudioTracks:[mixComposition tracksWithMediaType:AVMediaTypeAudio]
+                                               audioSettings:nil];
+    
+    [self.assetAudioReader addOutput:self.assetAudioReaderTrackOutput];
+    
+}
+
+
+
+- (void)setupAudioAssetWriter{
+    double preferredHardwareSampleRate = [[AVAudioSession sharedInstance] currentHardwareSampleRate];
+    
+    AudioChannelLayout acl;
+    bzero( &acl, sizeof(acl));
+    acl.mChannelLayoutTag = kAudioChannelLayoutTag_Mono;
+    
+    NSDictionary *audioOutputSettings = [NSDictionary dictionaryWithObjectsAndKeys:
+                                         [ NSNumber numberWithInt: kAudioFormatMPEG4AAC], AVFormatIDKey,
+                                         [ NSNumber numberWithInt: 1 ], AVNumberOfChannelsKey,
+                                         [ NSNumber numberWithFloat: preferredHardwareSampleRate ], AVSampleRateKey,
+                                         [ NSData dataWithBytes: &acl length: sizeof( acl ) ], AVChannelLayoutKey,
+                                         //[ NSNumber numberWithInt:AVAudioQualityLow], AVEncoderAudioQualityKey,
+                                         [ NSNumber numberWithInt: 64000 ], AVEncoderBitRateKey,
+                                         nil];
+    /*
+     AudioChannelLayout acl;
+     bzero( &acl, sizeof(acl));
+     acl.mChannelLayoutTag = kAudioChannelLayoutTag_Mono;
+     
+     audioOutputSettings = [NSDictionary dictionaryWithObjectsAndKeys:
+     [ NSNumber numberWithInt: kAudioFormatMPEG4AAC ], AVFormatIDKey,
+     [ NSNumber numberWithInt: 1 ], AVNumberOfChannelsKey,
+     [ NSNumber numberWithFloat: 44100.0 ], AVSampleRateKey,
+     [ NSNumber numberWithInt: 64000 ], AVEncoderBitRateKey,
+     [ NSData dataWithBytes: &acl length: sizeof( acl ) ], AVChannelLayoutKey,
+     nil];*/
+    
+    
+    assetWriterAudioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:audioOutputSettings];
+    [assetWriter addInput:assetWriterAudioInput];
+    assetWriterAudioInput.expectsMediaDataInRealTime = _encodingLiveVideo;
+}
+
 - (void)startRecording;
 {
-    alreadyFinishedRecording = NO;
-    startTime = kCMTimeInvalid;
-    runSynchronouslyOnContextQueue(_movieWriterContext, ^{
-        if (audioInputReadyCallback == NULL)
-        {
-            [assetWriter startWriting];
+    dispatch_group_notify([THImageMovieManager shared].readingAllReadyDispatchGroup, dispatch_get_main_queue(), ^{
+        NSLog(@"all set, readers and writer both are ready");
+        [self setupAudioAssetReader];
+        [self setupAudioAssetWriter];
+        
+        alreadyFinishedRecording = NO;
+        isRecording = YES;
+        
+        BOOL aduioReaderStartSuccess = [self.assetAudioReader startReading];
+        if(!aduioReaderStartSuccess){
+            NSLog(@"asset audio reader start reading failed: %@", self.assetAudioReader.error);
+            return;
         }
+        
+        startTime = kCMTimeInvalid;
+        [self.assetWriter startWriting];
+        [self.assetWriter startSessionAtSourceTime:kCMTimeZero];
+        NSLog(@"asset write is good to write...");
+        
+        [self kickoffRecording];
     });
-    isRecording = YES;
-	//    [assetWriter startSessionAtSourceTime:kCMTimeZero];
+}
+
+- (void)kickoffRecording {
+    
+    // If the asset reader and writer both started successfully, create the dispatch group where the reencoding will take place and start a sample-writing session.
+    self.recordingDispatchGroup = dispatch_group_create();
+    self.audioFinished = NO;
+    self.videoFinished = NO;
+    
+    
+    [self kickOffAudioWriting];
+    
+    [self kickOffVideoWriting];
+    
+    
+    __unsafe_unretained typeof(self) weakSelf = self;
+    
+    // Set up the notification that the dispatch group will send when the audio and video work have both finished.
+    dispatch_group_notify(self.recordingDispatchGroup, [THImageMovieManager shared].mainSerializationQueue, ^{
+        weakSelf.videoFinished = NO;
+        weakSelf.audioFinished = NO;
+        [weakSelf.assetWriter finishWritingWithCompletionHandler:^{
+            if(weakSelf.completionBlock){
+                weakSelf.completionBlock();
+            }
+        }];
+    });
+    
+    
+}
+
+- (void)kickOffAudioWriting{
+    dispatch_group_enter(self.recordingDispatchGroup);
+    __unsafe_unretained typeof(self) weakSelf = self;
+    
+    
+    CMTime shortestDuration = kCMTimeInvalid;
+    for (THImageMovie *movie in self.movies) {
+        AVAsset *asset = movie.asset;
+        
+        if(CMTIME_IS_INVALID(shortestDuration)){
+            shortestDuration = asset.duration;
+        }else{
+            
+            if(CMTimeCompare(asset.duration, shortestDuration) == -1){
+                shortestDuration = asset.duration;
+            }
+        }
+    }
+    
+    NSLog(@"---shortest duratioN: %.2f", CMTimeGetSeconds(shortestDuration));
+    
+    [assetWriterAudioInput requestMediaDataWhenReadyOnQueue:[THImageMovieManager shared].rwAudioSerializationQueue usingBlock:^{
+        // Because the block is called asynchronously, check to see whether its task is complete.
+        if (self.audioFinished)
+            return;
+        
+        BOOL completedOrFailed = NO;
+        // If the task isn't complete yet, make sure that the input is actually ready for more media data.
+        while ([assetWriterAudioInput isReadyForMoreMediaData] && !completedOrFailed) {
+            // Get the next audio sample buffer, and append it to the output file.
+            CMSampleBufferRef sampleBuffer = [self.assetAudioReaderTrackOutput copyNextSampleBuffer];
+            if (sampleBuffer != NULL) {
+                CMTime currentSampleTime = CMSampleBufferGetOutputPresentationTimeStamp(sampleBuffer);
+                BOOL isDone = CMTimeCompare(shortestDuration, currentSampleTime) == -1;
+                
+                BOOL success = [assetWriterAudioInput appendSampleBuffer:sampleBuffer];
+                weakSelf.audioWroteDuration = CMTimeGetSeconds(currentSampleTime);
+                if (success) {
+                    //NSLog(@"append audio buffer success");
+                } else {
+                    NSLog(@"append audio buffer failed");
+                }
+                CFRelease(sampleBuffer);
+                sampleBuffer = NULL;
+                completedOrFailed = !success;
+                
+                if(isDone){
+                    //time out mark as finish
+                    completedOrFailed = YES;
+                }
+            }
+            else {
+                completedOrFailed = YES;
+            }
+            
+            
+        }//end of loop
+        
+        if (completedOrFailed) {
+            NSLog(@"kickOffAudioWriting wrint done");
+            // Mark the input as finished, but only if we haven't already done so, and then leave the dispatch group (since the audio work has finished).
+            BOOL oldFinished = self.audioFinished;
+            self.audioFinished = YES;
+            if (!oldFinished) {
+                [assetWriterAudioInput markAsFinished];
+                dispatch_group_leave(self.recordingDispatchGroup);
+            };
+        }
+    }];
+}
+
+- (void)kickOffVideoWriting {
+    
+    dispatch_group_enter(self.recordingDispatchGroup);
+    self.isFrameRecieved = NO;
+    __unsafe_unretained typeof(self) weakSelf = self;
+    self.firstVideoFrameTime = -1;
+    self.onFramePixelBufferReceived = ^(CMTime frameTime, CVPixelBufferRef pixel_buffer){
+        
+        [weakSelf->assetWriterPixelBufferInput appendPixelBuffer:pixel_buffer withPresentationTime:frameTime];
+        //NSLog(@"******writeSucceeded: %d, at time: %.2f", writeSucceeded, CMTimeGetSeconds(frameTime));
+        if(weakSelf.firstVideoFrameTime == -1){
+            weakSelf.firstVideoFrameTime = CMTimeGetSeconds(frameTime);
+        }
+        CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+        
+        weakSelf.videoWroteDuration = CMTimeGetSeconds(frameTime);
+        
+        if (![GPUImageContext supportsFastTextureUpload])
+        {
+            CVPixelBufferRelease(pixel_buffer);
+        }
+        weakSelf.isFrameRecieved = NO;
+    };
+    
+    [assetWriterVideoInput requestMediaDataWhenReadyOnQueue:[THImageMovieManager shared].rwVideoSerializationQueue usingBlock:^{
+        if (self.videoFinished)
+            return;
+        
+        BOOL completedOrFailed = NO;
+        // If the task isn't complete yet, make sure that the input is actually ready for more media data.
+        while ([assetWriterVideoInput isReadyForMoreMediaData] && !completedOrFailed) {
+            
+            
+            if(!self.isFrameRecieved){
+                self.isFrameRecieved = YES;
+                for(THImageMovie *movie in self.movies){
+                    BOOL hasMoreFrame = [movie renderNextFrame];
+                    //NSLog(@"--movie: %@, has more frames: %d", movie.url.lastPathComponent, hasMoreFrame);
+                    if(!hasMoreFrame){
+                        completedOrFailed = YES;
+                        break;
+                    }
+                }
+            }
+            
+        }
+        
+        if(completedOrFailed){
+            
+            NSLog(@"kickOffVideoWriting mark as finish");
+            // Mark the input as finished, but only if we haven't already done so, and then leave the dispatch group (since the video work has finished).
+            BOOL oldFinished = self.videoFinished;
+            self.videoFinished = YES;
+            if (!oldFinished) {
+                for(THImageMovie *movie in self.movies){
+                    [movie cancelProcessing];
+                }
+                [assetWriterVideoInput markAsFinished];
+                dispatch_group_leave(self.recordingDispatchGroup);
+            }
+        }
+    }];
+    
 }
 
 - (void)startRecordingInOrientation:(CGAffineTransform)orientationTransform;
@@ -786,37 +1051,9 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
             }
         }
         
-        void(^write)() = ^() {
-            while( ! assetWriterVideoInput.readyForMoreMediaData && ! _encodingLiveVideo && ! videoEncodingIsFinished ) {
-                NSDate *maxDate = [NSDate dateWithTimeIntervalSinceNow:0.1];
-                //            NSLog(@"video waiting...");
-                [[NSRunLoop currentRunLoop] runUntilDate:maxDate];
-            }
-            if (!assetWriterVideoInput.readyForMoreMediaData)
-            {
-                NSLog(@"2: Had to drop a video frame: %@", CFBridgingRelease(CMTimeCopyDescription(kCFAllocatorDefault, frameTime)));
-            }
-            else if(self.assetWriter.status == AVAssetWriterStatusWriting)
-            {
-                if (![assetWriterPixelBufferInput appendPixelBuffer:pixel_buffer withPresentationTime:frameTime])
-                    NSLog(@"Problem appending pixel buffer at time: %@", CFBridgingRelease(CMTimeCopyDescription(kCFAllocatorDefault, frameTime)));
-            }
-            else
-            {
-                NSLog(@"Couldn't write a frame");
-                //NSLog(@"Wrote a video frame: %@", CFBridgingRelease(CMTimeCopyDescription(kCFAllocatorDefault, frameTime)));
-            }
-            CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
-            
-            previousFrameTime = frameTime;
-            
-            if (![GPUImageContext supportsFastTextureUpload])
-            {
-                CVPixelBufferRelease(pixel_buffer);
-            }
-        };
-        
-        write();
+        if (self.onFramePixelBufferReceived) {
+            self.onFramePixelBufferReceived(frameTime, pixel_buffer);
+        }
         
         [inputFramebufferForBlock unlock];
     });
@@ -851,7 +1088,7 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
 
 - (void)endProcessing 
 {
-    if (completionBlock) 
+ /*   if (completionBlock)
     {
         if (!alreadyFinishedRecording)
         {
@@ -865,7 +1102,7 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
         {
             [_delegate movieRecordingCompleted];
         }
-    }
+    }*/
 }
 
 - (BOOL)shouldIgnoreUpdatesToThisTarget;
