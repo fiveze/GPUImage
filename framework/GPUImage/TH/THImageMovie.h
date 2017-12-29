@@ -2,7 +2,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import "GPUImageContext.h"
 #import "GPUImageOutput.h"
-#import "THImageMovieWriter.h"
+#import "GPUImageMovieWriter.h"
 
 /** Protocol for getting Movie played callback.
  */

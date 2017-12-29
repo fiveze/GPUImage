@@ -42,7 +42,7 @@ THImageMovie
 @synthesize asset = _asset;
 @synthesize runBenchmark = _runBenchmark;
 @synthesize playAtActualSpeed = _playAtActualSpeed;
-@synthesize delegate = _delegate;
+@synthesize delegate = _deleate;
 @synthesize shouldRepeat = _shouldRepeat;
 
 #pragma mark -
